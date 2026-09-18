@@ -1,3 +1,5 @@
+import type { Order } from './orders';
+
 export interface InventoryItem {
   name: string;
   qty: number;
@@ -12,6 +14,7 @@ export interface Movement {
   kind: MovementKind;
   created_at: string;
   items: InventoryItem[];
+  trade?: { kind: 'purchase' | 'sale'; total_cents: number };
 }
 
 export interface Inventory {
@@ -19,6 +22,16 @@ export interface Inventory {
   message_id?: string;
   add_channel_id?: string;
   remove_channel_id?: string;
+  purchase_channel_id?: string;
+  sale_channel_id?: string;
+  orders_channel_id?: string;
+  orders?: Order[];
+  finance?: {
+    channel_id: string;
+    message_id?: string;
+    initial_cents: number;
+    balance_cents: number;
+  };
   items: InventoryItem[];
   movements: Movement[];
 }

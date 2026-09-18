@@ -9,6 +9,357 @@ const handler = require('../dist/events/guild/messageCreate').default;
 const command = require('../dist/commands/utility/stock').default;
 const fs = require('node:fs');
 const originalWriteBackup = storage.writeBackup;
+const financeCore = require('../dist/utils/finance');
+const financeCommand = require('../dist/commands/utility/finance').default;
+const orderCore = require('../dist/utils/orders');
+const orderCommand = require('../dist/commands/utility/orders').default;
+const sampleOrder =
+  'Pedido • 10000 Canas de açucar • 10000 Trigos • 10000 Milhos Total: 30000unidades Valor: 0,17 Und Local: Vet Strawberry Telegrama: via dc';
+
+function enableOrders() {
+  enableFinance();
+  saved.orders_channel_id = 'orders';
+  let starts = 0;
+  const thread = {
+    id: 'order-message',
+    parentId: 'orders',
+    archived: false,
+    isThread: () => true,
+    messages: { fetch: async () => ({ edit: async (payload) => edits.push(payload) }) },
+    send: async (payload) => {
+      sends.push(payload);
+      return { id: 'order-summary' };
+    },
+    setArchived: async () => {
+      thread.archived = false;
+    },
+  };
+  const source = {
+    id: 'order-message',
+    hasThread: false,
+    startThread: async () => {
+      starts++;
+      source.hasThread = true;
+      return thread;
+    },
+  };
+  const ordersChannel = { ...channel, messages: { fetch: async () => source } };
+  guild.channels.fetch = async (id) =>
+    id === 'orders' ? ordersChannel : id === thread.id ? thread : channel;
+  return { source, thread, ordersChannel, starts: () => starts };
+}
+
+function orderInteraction(sub, value = null, permitted = true) {
+  const result = interaction(sub, 'order-message', permitted);
+  result.options.getString = () => value;
+  result.user = { id: 'manager' };
+  return result;
+}
+
+test('order parses supplied format and newline format and computes unit price exactly', () => {
+  const order = orderCore.parseOrder(sampleOrder);
+  assert.equal(order.total_qty, 30000);
+  assert.equal(order.unit_cents, 17);
+  assert.equal(order.total_cents, 510000);
+  assert.equal(order.location, 'Vet Strawberry');
+  assert.equal(order.contact, 'via dc');
+  assert.equal(order.items.length, 3);
+  assert.deepEqual(orderCore.parseOrder(sampleOrder.replaceAll(' • ', '\n')), order);
+  for (const value of [
+    sampleOrder.replace('30000unidades', '2unidades'),
+    sampleOrder.replace('0,17', '0'),
+    sampleOrder.replace('0,17', '0,175'),
+    sampleOrder.replace('0,17', '90071992547409'),
+    'Pedido qualquer coisa',
+  ])
+    assert.throws(() => orderCore.parseOrder(value));
+});
+
+test('order opens one thread and does not credit cash until completed', async () => {
+  const state = enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  assert.equal(state.starts(), 1);
+  assert.equal(saved.orders.length, 1);
+  assert.equal(saved.orders[0].thread_id, 'order-message');
+  assert.equal(saved.orders[0].summary_id, 'order-summary');
+  assert.equal(saved.finance.balance_cents, 10000);
+  assert.equal(sends.length, 1);
+  assert.match(sends[0].content, /5\.100,00/);
+});
+
+test('concurrent order completion credits once and stores payment audit without changing stock', async () => {
+  enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  await Promise.all([
+    orderCommand.execute(orderInteraction('finalizar')),
+    orderCommand.execute(orderInteraction('finalizar')),
+  ]);
+  assert.equal(saved.finance.balance_cents, 520000);
+  assert.equal(saved.orders[0].paid_cents, 510000);
+  assert.equal(saved.orders[0].completed_by, 'manager');
+  assert.ok(saved.orders[0].completed_at);
+  assert.deepEqual(saved.items, []);
+  assert.ok(edits.some((payload) => payload.content.includes('Encomenda finalizada')));
+});
+
+test('order completion accepts actual paid total and rejects unauthorized and invalid payment', async () => {
+  enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  await orderCommand.execute(orderInteraction('finalizar', null, false));
+  await orderCommand.execute(orderInteraction('finalizar', '0'));
+  assert.equal(saved.finance.balance_cents, 10000);
+  assert.equal(saved.orders[0].completed_at, undefined);
+  await orderCommand.execute(orderInteraction('finalizar', '5.000,50'));
+  assert.equal(saved.finance.balance_cents, 510050);
+  assert.equal(saved.orders[0].paid_cents, 500050);
+});
+
+test('failed order publication keeps paid status and sync repairs without another credit', async () => {
+  const state = enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  state.thread.messages.fetch = async () => {
+    throw new Error('offline');
+  };
+  const finish = orderInteraction('finalizar');
+  await orderCommand.execute(finish);
+  assert.equal(saved.finance.balance_cents, 520000);
+  assert.match(finish.replies[0].content, /Pagamento salvo/);
+  state.thread.messages.fetch = async () => ({ edit: async (payload) => edits.push(payload) });
+  await orderCommand.execute(orderInteraction('sincronizar', 'order-message'));
+  assert.equal(saved.finance.balance_cents, 520000);
+  assert.match(edits.at(-2).content, /finalizada/);
+});
+
+test('failed order commit never credits or publishes completion', async () => {
+  enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  mock.method(storage, 'writeBackup', () => {
+    throw new Error('disk full');
+  });
+  await orderCommand.execute(orderInteraction('finalizar'));
+  assert.equal(saved.finance.balance_cents, 10000);
+  assert.equal(saved.orders[0].completed_at, undefined);
+  assert.equal(edits.length, 0);
+});
+
+test('thread creation failure can be recovered from original order id', async () => {
+  const state = enableOrders();
+  const create = state.source.startThread;
+  state.source.startThread = async () => {
+    throw new Error('offline');
+  };
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  assert.equal(saved.orders.length, 1);
+  assert.equal(saved.orders[0].thread_id, undefined);
+  state.source.startThread = create;
+  await orderCommand.execute(orderInteraction('sincronizar', 'order-message'));
+  assert.equal(saved.orders[0].thread_id, 'order-message');
+  assert.equal(saved.finance.balance_cents, 10000);
+});
+
+test('recovers a thread created before thread id persistence failed', async () => {
+  const state = enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  delete saved.orders[0].thread_id;
+  await orderCommand.execute(orderInteraction('sincronizar', 'order-message'));
+  assert.equal(state.starts(), 1);
+  assert.equal(saved.orders[0].thread_id, 'order-message');
+});
+
+test('orders channel setup enforces permissions and distinct channels in both directions', async () => {
+  await orderCommand.execute(interaction('set-canal', 'orders', false));
+  assert.equal(saved.orders_channel_id, undefined);
+  await orderCommand.execute(interaction('set-canal', 'panel'));
+  assert.equal(saved.orders_channel_id, undefined);
+  await orderCommand.execute(interaction('set-canal', 'orders'));
+  assert.equal(saved.orders_channel_id, 'orders');
+  await command.execute(interaction('set-add', 'orders'));
+  assert.equal(saved.add_channel_id, 'in');
+  channel.permissionsFor = () => ({ has: (required) => required.length === 3 });
+  await orderCommand.execute(interaction('set-canal', 'new-orders'));
+  assert.equal(saved.orders_channel_id, 'orders');
+  const payload = orderCommand.data.toJSON();
+  assert.equal(payload.options[0].options[0].required, true);
+});
+
+test('invalid order cannot open a thread or save a record', async () => {
+  const state = enableOrders();
+  const value = message(
+    'order-message',
+    sampleOrder.replace('30000unidades', '1unidades'),
+    'orders',
+  );
+  await handler.execute(null, value);
+  assert.equal(saved.orders, undefined);
+  assert.equal(state.starts(), 0);
+  assert.match(value.replies[0].content, /soma/);
+});
+
+test('missing finance and balance overflow reject completion without changing order status', async () => {
+  enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  const finance = saved.finance;
+  delete saved.finance;
+  const missing = orderInteraction('finalizar');
+  await orderCommand.execute(missing);
+  assert.match(missing.replies[0].content, /financeiro start/);
+  assert.equal(saved.orders[0].completed_at, undefined);
+  saved.finance = { ...finance, balance_cents: Number.MAX_SAFE_INTEGER };
+  await orderCommand.execute(orderInteraction('finalizar'));
+  assert.equal(saved.finance.balance_cents, Number.MAX_SAFE_INTEGER);
+  assert.equal(saved.orders[0].completed_at, undefined);
+});
+
+test('archived order thread is reopened and deleted summary is recreated without repeating payment', async () => {
+  const state = enableOrders();
+  await handler.execute(null, message('order-message', sampleOrder, 'orders'));
+  state.thread.archived = true;
+  state.thread.messages.fetch = async () => {
+    throw Object.assign(new Error('deleted'), { code: 10008 });
+  };
+  await orderCommand.execute(orderInteraction('finalizar'));
+  assert.equal(state.thread.archived, false);
+  assert.equal(saved.finance.balance_cents, 520000);
+  assert.match(sends.at(-1).content, /finalizada/);
+});
+
+function enableFinance() {
+  saved.purchase_channel_id = 'purchases';
+  saved.sale_channel_id = 'sales';
+  saved.finance = {
+    channel_id: 'finance',
+    message_id: 'finance-message',
+    initial_cents: 10000,
+    balance_cents: 10000,
+  };
+}
+
+test('money parsing is exact and rejects malformed values and overflow', () => {
+  assert.equal(financeCore.parseMoney('R$ 1.234,56'), 123456);
+  assert.equal(financeCore.parseMoney('0,01'), 1);
+  for (const value of ['-1', '1,234', '1.23', 'NaN', '', '9007199254740992'])
+    assert.throws(() => financeCore.parseMoney(value));
+});
+
+test('purchases and sales update both balances and panels without replaying duplicates', async () => {
+  enableFinance();
+  await handler.execute(null, message('buy', 'Farinha 10 25,50\nMadeira 2 10', 'purchases'));
+  assert.equal(saved.finance.balance_cents, 6450);
+  await handler.execute(null, message('sell', '4 farinha 20,00', 'sales'));
+  await handler.execute(null, message('sell', '4 farinha | 20,00', 'sales'));
+  assert.equal(saved.finance.balance_cents, 8450);
+  assert.equal(saved.items.find((item) => item.name === 'Farinha').qty, 6);
+  assert.equal(saved.movements.length, 2);
+  assert.equal(saved.movements[0].trade.total_cents, 3550);
+  assert.ok(edits.some((payload) => payload.content.includes('84,50')));
+});
+
+test('invalid trade or insufficient stock leaves both balances unchanged', async () => {
+  enableFinance();
+  saved.items = [{ name: 'Farinha', qty: 3 }];
+  for (const content of [
+    'Farinha 4 | 10',
+    'Farinha 1 | 10\nMadeira 1 | 20',
+    'Farinha 1 | 0',
+    'Farinha 1 | 2,123',
+  ]) {
+    const value = message(content, content, 'sales');
+    await handler.execute(null, value);
+    assert.equal(saved.finance.balance_cents, 10000);
+    assert.equal(saved.items[0].qty, 3);
+    assert.equal(saved.movements.length, 0);
+    assert.equal(value.replies.length, 1);
+  }
+});
+
+test('trades accept spaces, currency prefix and optional legacy separator', () => {
+  for (const line of [
+    'Farinha de trigo 10 25,50',
+    '10 Farinha de trigo 25,50',
+    'Farinha de trigo 10 R$ 25,50',
+    'Farinha de trigo 10 | 25,50',
+  ]) {
+    assert.deepEqual(financeCore.parseTrade(line), {
+      items: [{ name: 'Farinha de trigo', qty: 10 }],
+      total_cents: 2550,
+    });
+  }
+  for (const line of [
+    'Farinha 10',
+    'Farinha 10 0',
+    'Farinha 10 -25',
+    'Farinha 10 2,123',
+    'Farinha 10 | 25 | 30',
+  ])
+    assert.throws(() => financeCore.parseTrade(line));
+});
+
+test('concurrent purchases preserve cents and permit a negative cash balance', async () => {
+  enableFinance();
+  saved.finance.balance_cents = 1;
+  await Promise.all(
+    Array.from({ length: 10 }, (_, i) =>
+      handler.execute(null, message(`buy-${i}`, 'Farinha 1 | 0,01', 'purchases')),
+    ),
+  );
+  assert.equal(saved.finance.balance_cents, -9);
+  assert.equal(saved.items[0].qty, 10);
+});
+
+test('trade requires finance and a failed save cannot update either panel', async () => {
+  saved.purchase_channel_id = 'purchases';
+  await handler.execute(null, message('missing', 'Farinha 1 | 10', 'purchases'));
+  assert.equal(saved.items.length, 0);
+  enableFinance();
+  mock.method(storage, 'writeBackup', () => {
+    throw new Error('disk full');
+  });
+  await handler.execute(null, message('failed', 'Farinha 1 | 10', 'purchases'));
+  assert.equal(saved.items.length, 0);
+  assert.equal(saved.finance.balance_cents, 10000);
+  assert.equal(edits.length, 0);
+});
+
+test('finance publication failure preserves transaction and retry repairs without doubling', async () => {
+  enableFinance();
+  guild.channels.fetch = async (id) => {
+    if (id === 'finance') throw new Error('offline');
+    return channel;
+  };
+  const value = message('buy', 'Farinha 1 | 10', 'purchases');
+  await handler.execute(null, value);
+  assert.equal(saved.finance.balance_cents, 9000);
+  assert.match(value.replies[0].content, /Movimentacao salva/);
+  assert.equal(edits.length, 1);
+  guild.channels.fetch = async () => channel;
+  await handler.execute(null, value);
+  assert.equal(saved.finance.balance_cents, 9000);
+  assert.equal(saved.items[0].qty, 1);
+  assert.equal(value.reactions.length, 1);
+});
+
+test('finance setup initializes once, preserves cash on move and rejects overlapping channels', async () => {
+  const first = interaction('start', 'finance');
+  first.options.getString = () => '100,00';
+  await financeCommand.execute(first);
+  assert.equal(saved.finance.balance_cents, 10000);
+  saved.finance.balance_cents = 5000;
+  await financeCommand.execute(first);
+  assert.equal(saved.finance.balance_cents, 5000);
+  const move = interaction('start', 'new-finance');
+  move.options.getString = () => null;
+  await financeCommand.execute(move);
+  assert.equal(saved.finance.channel_id, 'new-finance');
+  assert.equal(saved.finance.balance_cents, 5000);
+  await financeCommand.execute(interaction('set-compras', 'purchases'));
+  await financeCommand.execute(interaction('set-vendas', 'purchases'));
+  assert.equal(saved.sale_channel_id, undefined);
+  await command.execute(interaction('start', 'purchases'));
+  assert.equal(saved.channel_id, 'panel');
+  await financeCommand.execute(interaction('set-vendas', 'sales', false));
+  assert.equal(saved.sale_channel_id, undefined);
+});
 
 let saved, edits, sends, guild, channel;
 beforeEach(() => {
@@ -229,16 +580,25 @@ test('entry and exit messages update the saved panel and audit history', async (
 
 test('entry and withdrawal reorder stock by descending quantity with alphabetical ties', async () => {
   await handler.execute(null, message('sort-add', 'Farinha 10\nMadeira 20\nArroz 10'));
-  assert.deepEqual(saved.items.map(item => item.name), ['Madeira', 'Arroz', 'Farinha']);
+  assert.deepEqual(
+    saved.items.map((item) => item.name),
+    ['Madeira', 'Arroz', 'Farinha'],
+  );
   await handler.execute(null, message('sort-remove', 'Madeira 15', 'out'));
-  assert.deepEqual(saved.items.map(item => item.name), ['Arroz', 'Farinha', 'Madeira']);
+  assert.deepEqual(
+    saved.items.map((item) => item.name),
+    ['Arroz', 'Farinha', 'Madeira'],
+  );
   const panel = edits.at(-1).content;
   assert.ok(panel.indexOf('Arroz') < panel.indexOf('Farinha'));
   assert.ok(panel.indexOf('Farinha') < panel.indexOf('Madeira'));
 });
 
 test('panel sorts legacy stock without mutating its input', () => {
-  const items = [{ name: 'Farinha', qty: 0 }, { name: 'Madeira', qty: 30 }];
+  const items = [
+    { name: 'Farinha', qty: 0 },
+    { name: 'Madeira', qty: 30 },
+  ];
   const panel = core.formatInventory(items);
   assert.ok(panel.indexOf('Madeira') < panel.indexOf('Farinha'));
   assert.equal(items[0].name, 'Farinha');

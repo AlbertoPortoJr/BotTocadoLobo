@@ -83,6 +83,79 @@ Novas movimentações não atualizam a tabela legada `inventories`. Faça backup
 
 O ID de cada movimentação é salvo junto com o saldo para impedir reaplicação de eventos repetidos, inclusive após reiniciar. Uma nova mensagem com outro ID representa uma nova movimentação. O painel usa uma mensagem de até 2.000 caracteres; operações que excederiam esse limite são rejeitadas antes de salvar. O histórico local cresce com as movimentações.
 
+## Financeiro, compras e vendas
+
+Registre os novos comandos com `npm run deploy:commands` e reinicie o bot depois do build (`npm run build`). Com o painel de estoque configurado, use:
+
+```text
+/financeiro start canal:#financeiro saldo-inicial:1.000,00
+/financeiro set-compras canal:#compras
+/financeiro set-vendas canal:#vendas
+```
+
+Esses comandos exigem **Gerenciar Servidor**. Os canais de compras, vendas, financeiro, estoque, entrada e saída precisam ser distintos. O bot precisa das mesmas permissões dos canais de estoque, incluindo Adicionar Reações em compras e vendas. As permissões de enviar mensagens nesses chats controlam quem pode registrar operações.
+
+Nos chats de compras e vendas, envie um item por linha:
+
+```text
+Farinha de trigo 10 25,50
+2 Madeira 10,00
+```
+
+O último valor é o **total da linha**, não o preço unitário. Nesse exemplo, a operação soma 35,50. Não é necessário usar separadores especiais; o formato anterior com `|` também é aceito. Use valores positivos no formato brasileiro, com até duas casas decimais (`25`, `25,50`, `1.250,00` ou `R$ 25,50`).
+
+- Compras adicionam os itens ao estoque e descontam o custo do financeiro. O saldo financeiro pode ficar negativo.
+- Vendas retiram os itens do estoque e adicionam a receita. Estoque insuficiente ou qualquer linha inválida rejeita a mensagem inteira, sem alterar itens ou dinheiro.
+- O financeiro exibe saldo inicial e saldo atual em uma mensagem Markdown no mesmo padrão do estoque. Ambos os painéis são atualizados após cada compra ou venda.
+- Entradas e saídas comuns do estoque continuam sem movimentar dinheiro.
+- O saldo inicial é informado apenas na primeira configuração. `/financeiro start` sincroniza o painel; com `canal`, muda sua localização preservando o saldo. Informar novamente `saldo-inicial` é rejeitado para evitar apagar o resultado das operações.
+- Estoque, dinheiro e histórico são gravados juntos em `data/inventories.json`, com valores monetários em centavos e proteção contra eventos duplicados. Faça backup dessa pasta.
+- Se a atualização de um painel falhar após salvar, não reenvie a operação: use `/stock start` e `/financeiro start` sem saldo inicial. Painéis apagados são recriados. Editar ou apagar mensagens não estorna operações; mensagens enviadas com o bot desligado não são importadas.
+
+## Encomendas
+
+Após registrar os comandos e reiniciar o bot, configure um canal de texto separado dos outros canais:
+
+```text
+/encomendas set-canal canal:#encomendas
+```
+
+O bot precisa de Ver Canal, Enviar Mensagens, Ler Histórico de Mensagens, Criar Tópicos Públicos e Enviar Mensagens em Tópicos. Quem pode enviar mensagens nesse canal pode cadastrar pedidos. Configuração, finalização e sincronização exigem **Gerenciar Servidor**.
+
+Envie o pedido neste formato, em uma linha ou separando os itens por quebras de linha (o marcador `•` é opcional quando cada item está em sua própria linha):
+
+```text
+Pedido
+10000 Canas de açucar
+10000 Trigos
+10000 Milhos
+Total: 30000unidades
+Valor: 0,17 Und
+Local: Vet Strawberry
+Telegrama: via dc
+```
+
+O bot verifica se o total corresponde à soma dos itens, salva o pedido e abre um tópico na mensagem original com seu resumo. O valor é **por unidade**: nesse exemplo, 30.000 × 0,17 = **5.100,00**. A abertura não altera o caixa.
+
+Depois de receber o pagamento, execute **dentro do tópico**:
+
+```text
+/encomendas finalizar
+```
+
+Esse comando credita o total previsto no financeiro. Se o valor recebido for diferente, informe o total efetivamente pago:
+
+```text
+/encomendas finalizar valor-pago:5.000,00
+```
+
+- Configure o caixa com `/financeiro start` antes de finalizar. O valor pago deve ser positivo.
+- A finalização salva o valor pago, responsável e data junto com o novo saldo, e atualiza o resumo do tópico e o painel financeiro. Finalizar novamente o mesmo pedido não repete o crédito.
+- Encomendas não retiram itens automaticamente do estoque. Quando necessário, use o canal de saída ou `/stock remove`. **Não registre a mesma encomenda no chat de vendas**, pois isso lançaria uma segunda receita.
+- Pedidos e pagamentos ficam em `data/inventories.json`, preservados após reiniciar. Trocar o canal de encomendas não impede finalizar os pedidos antigos nos respectivos tópicos.
+- Se a criação do tópico ou a atualização das mensagens falhar, use `/encomendas sincronizar pedido:ID_DA_MENSAGEM_ORIGINAL`. Esse comando recupera a publicação sem adicionar pagamentos. Ele depende do canal e da mensagem original ainda existirem quando precisar criar o tópico.
+- Mensagens inválidas não criam encomendas. Editar/apagar a mensagem original não altera nem estorna um pedido salvo; uma nova mensagem representa outro pedido. Não há importação de mensagens enviadas enquanto o bot estava desligado.
+
 ### Verificação local
 
 ```bash

@@ -9,6 +9,7 @@ import {
 } from '../../services/inventory';
 import { writeBackup } from '../../utils/storage';
 import { InventoryError, validateItem } from '../../utils/inventory';
+import { assertDistinctChannel } from '../../utils/finance';
 
 const command: BotCommand = {
   data: new SlashCommandBuilder()
@@ -89,6 +90,11 @@ const command: BotCommand = {
         const inventory = await loadInventory(guild.id);
         if (sub === 'set-add' || sub === 'set-remove') {
           const channelId = interaction.options.getChannel('canal', true).id;
+          assertDistinctChannel(
+            inventory,
+            sub === 'set-add' ? 'add_channel_id' : 'remove_channel_id',
+            channelId,
+          );
           const otherId =
             sub === 'set-add' ? inventory.remove_channel_id : inventory.add_channel_id;
           if (channelId === otherId || channelId === inventory.channel_id)
@@ -104,6 +110,7 @@ const command: BotCommand = {
             interaction.options.getChannel('channel')?.id ??
             inventory.channel_id ??
             interaction.channelId;
+          assertDistinctChannel(inventory, 'channel_id', channelId);
           if (channelId === inventory.add_channel_id || channelId === inventory.remove_channel_id)
             throw new InventoryError(
               'O painel precisa ficar separado dos canais de entrada e saida.',

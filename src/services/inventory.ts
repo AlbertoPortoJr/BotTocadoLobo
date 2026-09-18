@@ -1,6 +1,7 @@
 import { ChannelType, Guild, PermissionFlagsBits, TextChannel } from 'discord.js';
 import { getInventory } from '../db';
 import { readBackup, writeBackup } from '../utils/storage';
+import { formatFinance } from '../utils/finance';
 import {
   applyMovement,
   formatInventory,
@@ -28,7 +29,16 @@ export function readInventory(guildId: string): Inventory | null {
   const saved = readBackup(guildId);
   if (!saved) return null;
   if (
+    saved.finance &&
+    (typeof saved.finance.channel_id !== 'string' ||
+      !Number.isSafeInteger(saved.finance.initial_cents) ||
+      saved.finance.initial_cents < 0 ||
+      !Number.isSafeInteger(saved.finance.balance_cents))
+  )
+    throw new Error('Dados financeiros invalidos. Restaure o arquivo de estoque.');
+  if (
     !Array.isArray(saved.items) ||
+    (saved.orders !== undefined && !Array.isArray(saved.orders)) ||
     (saved.movements !== undefined && !Array.isArray(saved.movements))
   ) {
     throw new Error('Dados de estoque invalidos. Restaure o arquivo de estoque.');
@@ -114,16 +124,58 @@ export async function recordMovement(
   if (!duplicate) {
     const items = applyMovement(inventory.items, movement.items, movement.kind);
     formatInventory(items);
-    const next = { ...inventory, items, movements: [...inventory.movements, movement] };
+    let finance = inventory.finance;
+    if (movement.trade) {
+      if (!finance)
+        throw new InventoryError('Configure o financeiro com /financeiro start primeiro.');
+      const { kind, total_cents } = movement.trade;
+      if (
+        !Number.isSafeInteger(total_cents) ||
+        total_cents <= 0 ||
+        movement.kind !== (kind === 'purchase' ? 'add' : 'remove')
+      )
+        throw new InventoryError('Movimentacao financeira invalida.');
+      const balance = finance.balance_cents + (kind === 'purchase' ? -total_cents : total_cents);
+      if (!Number.isSafeInteger(balance))
+        throw new InventoryError('Saldo financeiro fora do limite.');
+      finance = { ...finance, balance_cents: balance };
+    }
+    const next = { ...inventory, finance, items, movements: [...inventory.movements, movement] };
     // Commit balance and deduplication ID together, before any Discord notification.
     writeBackup(guild.id, next);
     inventory = next;
   }
   try {
-    await publishInventory(guild, inventory);
+    const results = await Promise.allSettled([
+      publishInventory(guild, inventory),
+      ...(movement.trade ? [publishFinance(guild, inventory)] : []),
+    ]);
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
   } catch (error) {
     console.error('Movimentacao salva, mas painel de estoque pendente:', error);
     return 'pending';
   }
   return duplicate ? 'duplicate' : 'saved';
+}
+
+export async function publishFinance(guild: Guild, inventory: Inventory): Promise<void> {
+  const finance = inventory.finance;
+  if (!finance) throw new InventoryError('Configure o financeiro com /financeiro start primeiro.');
+  const channel = await stockChannel(guild, finance.channel_id);
+  let message;
+  if (finance.message_id) {
+    try {
+      message = await channel.messages.fetch(finance.message_id);
+    } catch (error) {
+      if ((error as { code?: number }).code !== 10008) throw error;
+    }
+  }
+  const payload = { content: formatFinance(finance), allowedMentions: { parse: [] as never[] } };
+  if (message) await message.edit(payload);
+  else {
+    message = await channel.send(payload);
+    finance.message_id = message.id;
+    writeBackup(guild.id, inventory);
+  }
 }
