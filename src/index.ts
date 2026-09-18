@@ -1,33 +1,46 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits } from 'discord.js';
 import { loadCommands } from './handlers/commandHandler';
+import { loadEvents } from './handlers/eventHandler';
 import { initDb } from './db';
+import { info, error } from './utils/logger';
+import env from './config/env';
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
-loadCommands(client);
-
-client.once(Events.ClientReady, async () => {
-  console.log(`Logged in as ${client.user?.tag}`);
+async function start() {
   try {
-    await initDb();
-    console.log('Database initialized');
+    loadCommands(client);
+    loadEvents(client);
+    try {
+      await initDb();
+      info('Database initialized');
+    } catch (dbErr) {
+      error('Database initialization failed (continuing without DB):', dbErr);
+    }
+    await client.login(env.DISCORD_TOKEN);
+    info('Bot logged in');
   } catch (err) {
-    console.error('DB init failed', err);
+    if (err instanceof Error && /disallowed intents/i.test(err.message)) {
+      error('Discord recusou o Message Content Intent. Abra https://discord.com/developers/applications, selecione o bot e habilite Bot > Privileged Gateway Intents > Message Content Intent. Salve e reinicie com npm run dev.');
+    }
+    error('Failed to start bot', err);
+    process.exit(1);
   }
+}
+
+process.on('unhandledRejection', (reason) => {
+  error('Unhandled Rejection', reason);
+});
+process.on('uncaughtException', (err) => {
+  error('Uncaught Exception', err);
+  process.exit(1);
 });
 
-client.on(Events.InteractionCreate, async (interaction: any) => {
-  if (!interaction.isChatInputCommand()) return;
-  const command = client.commands.get(interaction.commandName);
-  if (!command) return interaction.reply({ content: 'Comando não encontrado', ephemeral: true });
-  try {
-    await command.execute(interaction);
-  } catch (err) {
-    console.error(err);
-    if (interaction.replied || interaction.deferred) await interaction.followUp({ content: 'Erro ao executar comando', ephemeral: true });
-    else await interaction.reply({ content: 'Erro ao executar comando', ephemeral: true });
-  }
+process.on('SIGINT', async () => {
+  info('Shutting down...');
+  await client.destroy();
+  process.exit(0);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+start();

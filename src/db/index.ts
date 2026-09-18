@@ -5,6 +5,7 @@ import path from 'path';
 dotenv.config();
 
 const pool = new Pool({
+  connectionTimeoutMillis: 5000,
   host: process.env.PG_HOST || 'localhost',
   port: Number(process.env.PG_PORT || 5432),
   user: process.env.PG_USER,
@@ -23,6 +24,15 @@ export async function initDb() {
 
   // fallback: create tables if migration file is not present
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS inventories (
+      id SERIAL PRIMARY KEY,
+      guild_id TEXT NOT NULL UNIQUE,
+      channel_id TEXT,
+      message_id TEXT,
+      items JSONB DEFAULT '[]'::jsonb,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS tickets (
       id SERIAL PRIMARY KEY,
       guild_id TEXT NOT NULL,
@@ -61,6 +71,27 @@ export async function createTicket(guildId: string, channelId: string, userId: s
 
 export async function closeTicket(channelId: string) {
   await pool.query('UPDATE tickets SET status=$1 WHERE channel_id=$2', ['closed', channelId]);
+}
+
+// Inventory functions
+export async function getInventory(guildId: string) {
+  const res = await pool.query('SELECT * FROM inventories WHERE guild_id=$1', [guildId]);
+  return res.rows[0];
+}
+
+export async function createOrEnsureInventory(guildId: string) {
+  const existing = await getInventory(guildId);
+  if (existing) return existing;
+  const res = await pool.query('INSERT INTO inventories (guild_id, items) VALUES ($1, $2) RETURNING *', [guildId, JSON.stringify([])]);
+  return res.rows[0];
+}
+
+export async function setInventoryMessage(guildId: string, channelId: string, messageId: string) {
+  await pool.query('UPDATE inventories SET channel_id=$1, message_id=$2, updated_at=NOW() WHERE guild_id=$3', [channelId, messageId, guildId]);
+}
+
+export async function updateInventoryItems(guildId: string, items: any[]) {
+  await pool.query('UPDATE inventories SET items=$1, updated_at=NOW() WHERE guild_id=$2', [JSON.stringify(items), guildId]);
 }
 
 export default pool;

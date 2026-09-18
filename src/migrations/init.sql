@@ -18,3 +18,12 @@ CREATE TABLE IF NOT EXISTS mod_logs (
   reason TEXT,
   created_at TIMESTAMP DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS inventories (
+  id SERIAL PRIMARY KEY,
+  guild_id TEXT NOT NULL UNIQUE,
+  channel_id TEXT,
+  message_id TEXT,
+  items JSONB DEFAULT '[]'::jsonb,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
